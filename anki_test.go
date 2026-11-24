@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestNewDeck(t *testing.T) {
@@ -589,5 +590,117 @@ func BenchmarkSave(b *testing.B) {
 		if err != nil {
 			b.Fatalf("Failed to save: %v", err)
 		}
+	}
+}
+
+func guidsOf(t *testing.T, deck *Deck) map[string]string {
+	t.Helper()
+	rows, err := deck.db.Query("SELECT sfld, guid FROM notes")
+	if err != nil {
+		t.Fatalf("Failed to query notes: %v", err)
+	}
+	defer rows.Close()
+	out := map[string]string{}
+	for rows.Next() {
+		var front, guid string
+		if err := rows.Scan(&front, &guid); err != nil {
+			t.Fatalf("Failed to scan: %v", err)
+		}
+		out[front] = guid
+	}
+	return out
+}
+
+func TestStableIdentityAcrossExports(t *testing.T) {
+	build := func(back string) (*Deck, map[string]string) {
+		deck, err := NewDeck("My Words")
+		if err != nil {
+			t.Fatalf("Failed to create deck: %v", err)
+		}
+		t.Cleanup(func() { deck.Close() })
+		if err := deck.AddCard("Hello", back); err != nil {
+			t.Fatalf("Failed to add card: %v", err)
+		}
+		if err := deck.AddCard("world", "x"); err != nil {
+			t.Fatalf("Failed to add card: %v", err)
+		}
+		return deck, guidsOf(t, deck)
+	}
+	first, g1 := build("old text")
+	second, g2 := build("new text")
+
+	// the same word keeps its guid when its back changes, between two exports
+	if g1["Hello"] == "" || g1["Hello"] != g2["Hello"] {
+		t.Errorf("guid of Hello changed: %q -> %q", g1["Hello"], g2["Hello"])
+	}
+	if g1["Hello"] == g1["world"] {
+		t.Error("two words share a guid")
+	}
+	// the deck and the model are the same too, or Anki would add a deck and a note type each time
+	if first.topDeckID != second.topDeckID || first.topModelID != second.topModelID {
+		t.Errorf("ids changed: deck %d -> %d, model %d -> %d", first.topDeckID, second.topDeckID, first.topModelID, second.topModelID)
+	}
+	if first.topDeckID == first.topModelID {
+		t.Error("deck and model have the same id")
+	}
+}
+
+func TestStableIDDiffersByName(t *testing.T) {
+	a, b := stableID("deck", "A"), stableID("deck", "B")
+	if a == b {
+		t.Error("two names give the same id")
+	}
+	for _, id := range []int64{a, b} {
+		if id < 1<<40 || id >= 1<<41 {
+			t.Errorf("id %d out of the expected range", id)
+		}
+	}
+}
+
+func TestGUIDIgnoresCaseAndMediaTags(t *testing.T) {
+	deck, err := NewDeck("D")
+	if err != nil {
+		t.Fatalf("Failed to create deck: %v", err)
+	}
+	defer deck.Close()
+	if err := deck.AddCardWithOptions("Word", "back", &CardOptions{FrontAudio: "a.mp3"}); err != nil {
+		t.Fatalf("Failed to add card: %v", err)
+	}
+	if err := deck.AddCard("  word ", "other back"); err != nil {
+		t.Fatalf("Failed to add card: %v", err)
+	}
+	var n int
+	if err := deck.db.QueryRow("SELECT COUNT(DISTINCT guid) FROM notes").Scan(&n); err != nil {
+		t.Fatalf("Failed to query notes: %v", err)
+	}
+	if n != 1 {
+		t.Errorf("Expected one note, got %d", n)
+	}
+}
+
+func TestFreshDecksAreNewEachTime(t *testing.T) {
+	build := func(opts *Options) *Deck {
+		deck, err := NewDeckWithOptions("My Words", opts)
+		if err != nil {
+			t.Fatalf("Failed to create deck: %v", err)
+		}
+		t.Cleanup(func() { deck.Close() })
+		if err := deck.AddCard("hello", "text"); err != nil {
+			t.Fatalf("Failed to add card: %v", err)
+		}
+		return deck
+	}
+	a := build(&Options{Fresh: true})
+	time.Sleep(2 * time.Millisecond) // the ids come from the millisecond clock
+	b := build(&Options{Fresh: true})
+	if a.topModelID == b.topModelID {
+		t.Error("fresh decks share the note type")
+	}
+	if guidsOf(t, a)["hello"] == guidsOf(t, b)["hello"] {
+		t.Error("fresh decks share the guid of a note")
+	}
+	// the default is stable
+	if build(nil).topModelID != build(&Options{}).topModelID {
+		t.Error("the default deck is not stable")
 	}
 }

@@ -5,7 +5,7 @@ import (
 	"log"
 	"os"
 
-	anki "github.com/ezynda3/go-anki-deck"
+	anki "github.com/huponx/go-anki-deck"
 )
 
 func main() {

@@ -2,10 +2,17 @@
 
 A Go package for creating and exporting Anki decks in .apkg format.
 
+> Fork of `ezynda3/go-anki-deck` for the dictionary service. Unlike upstream, the guid of a note is the hash of its
+> front and the ids of the deck and the note type come from the deck name, so importing a deck exported again
+> updates its cards in Anki instead of adding new ones. Two cards with the same front are one note.
+
+Pass `anki.Options{Fresh: true}` to `NewDeckWithOptions` to get the upstream behaviour: ids from the clock and a guid that
+also depends on the back, so every export is a new deck for Anki.
+
 ## Installation
 
 ```bash
-go get github.com/ezynda3/go-anki-deck
+go get github.com/huponx/go-anki-deck
 ```
 
 ## Usage
@@ -17,7 +24,7 @@ package main
 
 import (
     "log"
-    anki "github.com/ezynda3/go-anki-deck"
+    anki "github.com/huponx/go-anki-deck"
 )
 
 func main() {

@@ -1,49 +1,35 @@
 # Release Process
 
-This document describes how to create a new release for go-anki-deck.
+Releases are cut by `.github/workflows/release.yml`: every merge to `main` that changes Go code (or `go.mod` and
+`go.sum`) becomes a semver tag and a GitHub Release. Nothing is tagged by hand.
 
-## Automatic Release Process
+## Version bump
 
-Releases are automatically created when you push a new tag that follows semantic versioning (v*.*.*)
+The bump comes from the conventional-commit titles since the previous tag (a PR is squash-merged, so its title is
+the commit subject; `pr-title.yml` checks it):
 
-### Steps to Create a Release
+- `feat` is a minor bump, anything else a patch bump
+- `type!:` or `BREAKING CHANGE` is a minor bump too: a major bump is never automatic
 
-1. **Update version in code if needed** (optional)
+A major bump needs a new module path (`/v2`): change `module` in `go.mod` and the imports, then run the Release
+workflow by hand with `bump=major`.
 
-2. **Create and push a new tag:**
-   ```bash
-   # Create a new tag (replace X.Y.Z with your version)
-   git tag -a v0.X.Y -m "Release v0.X.Y"
-   
-   # Push the tag to GitHub
-   git push origin v0.X.Y
-   ```
+## Before merging
 
-3. **GitHub Actions will automatically:**
-   - Run all tests to ensure code quality
-   - Generate a changelog from commit messages
-   - Create a GitHub release with the changelog
+- [ ] `make test` and `go vet ./...` pass (CI runs them with `-race`, and checks `gofmt` and `go mod tidy`)
+- [ ] The README describes any change in behaviour
 
-### Version Numbering
+## Using a release
 
-We follow [Semantic Versioning](https://semver.org/):
-- **MAJOR** version for incompatible API changes
-- **MINOR** version for backwards-compatible functionality additions
-- **PATCH** version for backwards-compatible bug fixes
+```bash
+go get github.com/huponx/go-anki-deck@<tag>
+```
 
-### Pre-release Checklist
+## Changes from upstream (`ezynda3/go-anki-deck`)
 
-Before creating a release tag:
-- [ ] All tests pass (`make test`)
-- [ ] Code is properly formatted (`make fmt`)
-- [ ] Linter passes (`make lint`)
-- [ ] Documentation is up to date
-- [ ] CHANGELOG is updated (if maintaining one manually)
+This is a fork for the dictionary service. The one change of behaviour: ids that Anki matches on import are stable,
+so importing an exported deck again updates the notes instead of adding copies.
 
-### Manual Release (if needed)
-
-If the automatic process fails, you can create a release manually:
-1. Go to https://github.com/ezynda3/go-anki-deck/releases
-2. Click "Create a new release"
-3. Choose the tag you created
-4. Add release notes
+- the guid of a note is the hash of its front (trimmed, lower case), not of the deck id, front and back
+- the ids of the deck and of the note type come from the deck name, not from the clock
+- `Options{Fresh: true}` (`NewDeckWithOptions`) brings the upstream behaviour back, per deck
