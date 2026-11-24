@@ -1,5 +1,5 @@
 module github.com/huponx/go-anki-deck
 
-go 1.23.10
+go 1.26.10
 
-require github.com/mattn/go-sqlite3 v1.14.28
+require github.com/mattn/go-sqlite3 v1.14.53

@@ -10,7 +10,7 @@
 - Coverage: `make coverage`
 
 ## Code Style Guidelines
-- **Language**: Go 1.23.10
+- **Language**: Go 1.26.10
 - **Package**: All code in `package anki` except examples
 - **Imports**: Group stdlib, blank line, then external deps (e.g., `github.com/mattn/go-sqlite3`)
 - **Error Handling**: Return errors as last value, check immediately after function calls
