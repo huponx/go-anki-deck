@@ -31,7 +31,7 @@ Please be respectful and constructive in all interactions.
 
 ```bash
 # Clone your fork
-git clone https://github.com/yourusername/go-anki-deck.git
+git clone https://github.com/huponx/go-anki-deck.git
 cd go-anki-deck
 
 # Install dependencies

@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"crypto/sha1"
 	"database/sql"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"strconv"
@@ -23,6 +24,18 @@ type Deck struct {
 	media      []Media
 	topDeckID  int64
 	topModelID int64
+	fresh      bool
+}
+
+// Options are the settings of a new deck; the zero value is a deck with the default template and stable ids.
+type Options struct {
+	// Template customizes the card template (nil: the default).
+	Template *TemplateOptions
+	// Fresh makes every deck new for Anki, as upstream does: the ids of the deck and of the note type come from
+	// the clock, and the guid of a note also depends on those ids and on the back. Importing an export again then
+	// adds copies. The default (false) is stable: the ids come from the deck name and the guid from the front,
+	// so importing it again updates the cards.
+	Fresh bool
 }
 
 // Media represents a media file to be included in the deck
@@ -56,6 +69,14 @@ func NewDeck(name string) (*Deck, error) {
 
 // NewDeckWithTemplate creates a new Anki deck with custom template options
 func NewDeckWithTemplate(name string, templateOpts *TemplateOptions) (*Deck, error) {
+	return NewDeckWithOptions(name, &Options{Template: templateOpts})
+}
+
+// NewDeckWithOptions creates a new Anki deck with the given options (nil: the defaults).
+func NewDeckWithOptions(name string, opts *Options) (*Deck, error) {
+	if opts == nil {
+		opts = &Options{}
+	}
 	db, err := sql.Open("sqlite3", ":memory:")
 	if err != nil {
 		return nil, fmt.Errorf("failed to open database: %w", err)
@@ -65,9 +86,10 @@ func NewDeckWithTemplate(name string, templateOpts *TemplateOptions) (*Deck, err
 		name:  name,
 		db:    db,
 		media: []Media{},
+		fresh: opts.Fresh,
 	}
 
-	if err := deck.initializeDatabase(templateOpts); err != nil {
+	if err := deck.initializeDatabase(opts.Template); err != nil {
 		_ = db.Close()
 		return nil, fmt.Errorf("failed to initialize database: %w", err)
 	}
@@ -83,6 +105,8 @@ func (d *Deck) AddCard(front, back string) error {
 // AddCardWithOptions adds a new card with optional parameters
 func (d *Deck) AddCardWithOptions(front, back string, opts *CardOptions) error {
 	now := time.Now().UnixMilli()
+	// the identity of the note is the text of the front as given, before any media tag is added to it
+	identity := front
 
 	// Handle media attachments if provided
 	if opts != nil {
@@ -109,7 +133,7 @@ func (d *Deck) AddCardWithOptions(front, back string, opts *CardOptions) error {
 		}
 	}
 
-	noteGUID := d.getNoteGUID(d.topDeckID, front, back)
+	noteGUID := d.getNoteGUID(identity, front, back)
 	noteID := d.getNoteID(noteGUID, now)
 
 	var tagsStr string
@@ -292,9 +316,16 @@ func (d *Deck) initializeDatabase(templateOpts *TemplateOptions) error {
 		return fmt.Errorf("failed to execute template: %w", err)
 	}
 
-	now := time.Now().UnixMilli()
-	d.topDeckID = d.getID("cards", "did", now)
-	d.topModelID = d.getID("notes", "mid", now)
+	// Anki matches what it imports with what it has by these ids and by the guid of the notes: they derive from
+	// the name of the deck, so exporting the same deck again updates its notes instead of adding copies.
+	if d.fresh {
+		now := time.Now().UnixMilli()
+		d.topDeckID = d.getID("cards", "did", now)
+		d.topModelID = d.getID("notes", "mid", now)
+	} else {
+		d.topDeckID = stableID("deck", d.name)
+		d.topModelID = stableID("model", d.name)
+	}
 
 	// Update deck name
 	if err := d.updateDeckName(); err != nil {
@@ -399,9 +430,20 @@ func (d *Deck) getNoteID(guid string, ts int64) int64 {
 	return id.Int64
 }
 
-func (d *Deck) getNoteGUID(deckID int64, front, back string) string {
-	data := fmt.Sprintf("%d%s%s", deckID, front, back)
-	return fmt.Sprintf("%x", sha1.Sum([]byte(data)))
+// getNoteGUID is the guid of a note: it depends on the front only (case does not matter), so a note whose back
+// changed keeps its guid and Anki updates it on import. Two cards with the same front are one note.
+func (d *Deck) getNoteGUID(identity, front, back string) string {
+	if d.fresh {
+		return fmt.Sprintf("%x", sha1.Sum([]byte(fmt.Sprintf("%d%s%s", d.topDeckID, front, back))))
+	}
+	return fmt.Sprintf("%x", sha1.Sum([]byte(strings.ToLower(strings.TrimSpace(identity)))))
+}
+
+// stableID is an id for a deck or a model that is the same every time for the same name. It looks like the
+// millisecond timestamps Anki makes ids from (13 digits, from 2^40 up) and fits an int64 with room to spare.
+func stableID(kind, name string) int64 {
+	sum := sha1.Sum([]byte(kind + "\x00" + name))
+	return int64(binary.BigEndian.Uint64(sum[:8])>>24) | 1<<40
 }
 
 func (d *Deck) getCardID(noteID, ts int64) int64 {

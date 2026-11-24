@@ -1,62 +1,181 @@
 name: Release
 
+# Every merge to main that changes Go code is released as a semver tag + GitHub Release.
+# The bump comes from the conventional-commit titles since the previous tag:
+#   feat -> minor, anything else -> patch.
+#   type!: or BREAKING CHANGE -> minor too: a major bump is never automatic, run this
+#   workflow by hand with bump=major (a Go module needs a new /vN path from v2 on).
 on:
   push:
-    tags:
-      - 'v*.*.*'
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: Override the automatic bump (auto = from commits). Also releases when no Go file changed.
+        type: choice
+        options: [auto, patch, minor, major]
+        default: auto
 
 permissions:
   contents: write
 
+concurrency:
+  group: release
+  cancel-in-progress: false
+
 jobs:
   release:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
-      with:
-        fetch-depth: 0
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+          # BOT_TOKEN is needed once a tag ruleset restricts creating tags.
+          token: ${{ secrets.BOT_TOKEN || secrets.GITHUB_TOKEN }}
 
-    - name: Set up Go
-      uses: actions/setup-go@v5
-      with:
-        go-version: '1.23'
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
 
-    - name: Run tests
-      run: go test -v -race ./...
+      # Safety net: the merge commit can differ from what the PR was tested on.
+      - name: Build and test
+        run: |
+          set -euo pipefail
+          go build ./...
+          go test -count=1 ./...
 
-    - name: Generate changelog
-      id: changelog
-      run: |
-        # Get the previous tag
-        PREVIOUS_TAG=$(git describe --tags --abbrev=0 HEAD^ 2>/dev/null || echo "")
-        CURRENT_TAG=${GITHUB_REF#refs/tags/}
-        
-        echo "Previous tag: $PREVIOUS_TAG"
-        echo "Current tag: $CURRENT_TAG"
-        
-        # Generate changelog
-        if [ -z "$PREVIOUS_TAG" ]; then
-          echo "This is the first release!" > changelog.md
-          echo "" >> changelog.md
-          git log --pretty=format:"- %s" >> changelog.md
-        else
-          echo "## What's Changed" > changelog.md
-          echo "" >> changelog.md
-          git log ${PREVIOUS_TAG}..HEAD --pretty=format:"- %s" >> changelog.md
-        fi
-        
-        echo "" >> changelog.md
-        echo "" >> changelog.md
-        echo "**Full Changelog**: https://github.com/${{ github.repository }}/compare/${PREVIOUS_TAG}...${CURRENT_TAG}" >> changelog.md
-        
-        # Set changelog as output
-        echo "changelog<<EOF" >> $GITHUB_OUTPUT
-        cat changelog.md >> $GITHUB_OUTPUT
-        echo "EOF" >> $GITHUB_OUTPUT
+      - name: Release
+        id: release
+        env:
+          GH_TOKEN: ${{ secrets.BOT_TOKEN || secrets.GITHUB_TOKEN }}
+          EVENT: ${{ github.event_name }}
+          BUMP_INPUT: ${{ inputs.bump }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+          out() { echo "$1=$2" >> "${GITHUB_OUTPUT}"; }
+          out released false
 
-    - name: Create Release
-      uses: softprops/action-gh-release@v2
-      with:
-        body_path: changelog.md
-        generate_release_notes: false
+          if [ "${GITHUB_REF_NAME}" != "${DEFAULT_BRANCH}" ]; then
+            out reason "run it on ${DEFAULT_BRANCH}, not ${GITHUB_REF_NAME}"
+            echo "::error::releases are cut from ${DEFAULT_BRANCH} only"
+            exit 1
+          fi
+
+          latest="$(git tag -l 'v[0-9]*.[0-9]*.[0-9]*' --sort=-v:refname | head -n1 || true)"
+          out previous "${latest:-none}"
+
+          existing="$(git tag --points-at HEAD | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | head -n1 || true)"
+          if [ -n "${existing}" ]; then
+            out reason "HEAD is already released as ${existing}"
+            exit 0
+          fi
+
+          bump="auto"
+          [ "${EVENT}" = "workflow_dispatch" ] && bump="${BUMP_INPUT:-auto}"
+
+          if [ -z "${latest}" ]; then
+            tag="v0.1.0"
+            why="first release"
+          else
+            # Only Go code releases (docs, workflows and so on do not), unless a bump was chosen by hand.
+            if [ "${bump}" = "auto" ] \
+               && ! git diff --name-only "${latest}" HEAD | grep -qE '(\.go$|^go\.(mod|sum)$)'; then
+              out reason "no Go file changed since ${latest}"
+              exit 0
+            fi
+
+            if [ "${bump}" = "auto" ]; then
+              bump="patch"
+              why="no feat or breaking commit"
+              while IFS= read -r -d $'\x1e' rec; do
+                subject="${rec%%$'\x1f'*}"
+                subject="${subject#$'\n'}"
+                body="${rec#*$'\x1f'}"
+                if [[ "${subject}" =~ ^[a-z]+(\([^\)]*\))?!: ]] || grep -q 'BREAKING CHANGE' <<< "${body}"; then
+                  # Never an automatic major: breaking changes bump the minor.
+                  bump="minor"; why="breaking (minor, major is manual): ${subject}"
+                elif [[ "${subject}" =~ ^feat(\(|:|!) ]] && [ "${bump}" = "patch" ]; then
+                  bump="minor"; why="feat: ${subject}"
+                fi
+              done < <(git log --format='%s%x1f%b%x1e' "${latest}..HEAD")
+            else
+              why="chosen by hand"
+            fi
+
+            ver="${latest#v}"
+            major="${ver%%.*}"
+            rest="${ver#*.}"
+            minor="${rest%%.*}"
+            patch="${rest#*.}"
+            case "${bump}" in
+              major) major=$((major + 1)); minor=0; patch=0 ;;
+              minor) minor=$((minor + 1)); patch=0 ;;
+              patch) patch=$((patch + 1)) ;;
+              *) echo "unknown bump: ${bump}" >&2; exit 1 ;;
+            esac
+            tag="v${major}.${minor}.${patch}"
+          fi
+
+          # Go modules: major >= 2 needs the module path to end with /vN, lower majors must not.
+          tag_major="${tag#v}"; tag_major="${tag_major%%.*}"
+          modpath="$(awk '$1=="module"{print $2; exit}' go.mod)"
+          suffix=""
+          if [[ "${modpath}" =~ /v([0-9]+)$ ]]; then suffix="${BASH_REMATCH[1]}"; fi
+          expected=""
+          if [ "${tag_major}" -ge 2 ]; then expected="${tag_major}"; fi
+          if [ "${suffix}" != "${expected}" ]; then
+            out reason "module path '${modpath}' does not match tag ${tag}"
+            if [ -n "${expected}" ]; then
+              need="ending in /v${expected}"
+            else
+              need="without a /vN suffix"
+            fi
+            echo "::error::tag ${tag} needs a module path ${need}, but go.mod says '${modpath}'. For a major bump change 'module' in go.mod and every import first (github.com/huponx/go-anki-deck/v${tag_major}), then release."
+            exit 1
+          fi
+
+          echo "Releasing ${tag} (bump=${bump}, ${why}, previous=${latest:-none})"
+          url="$(gh release create "${tag}" --generate-notes --target "${GITHUB_SHA}")"
+
+          {
+            echo "released=true"
+            echo "tag=${tag}"
+            echo "bump=${bump}"
+            echo "why=${why}"
+            echo "url=${url}"
+          } >> "${GITHUB_OUTPUT}"
+
+      - name: Summary
+        if: always()
+        env:
+          RESULT: ${{ job.status }}
+          RELEASED: ${{ steps.release.outputs.released }}
+          REASON: ${{ steps.release.outputs.reason }}
+          PREVIOUS: ${{ steps.release.outputs.previous }}
+          TAG: ${{ steps.release.outputs.tag }}
+          BUMP: ${{ steps.release.outputs.bump }}
+          WHY: ${{ steps.release.outputs.why }}
+          URL: ${{ steps.release.outputs.url }}
+        run: |
+          {
+            echo "## Release"
+            echo ""
+            echo "| Field | Value |"
+            echo "|---|---|"
+            echo "| Result | ${RESULT} |"
+            echo "| Go | $(go version 2>/dev/null | tr -s ' ' || echo n/a) |"
+            if [ "${RELEASED}" = "true" ]; then
+              echo "| Tag | \`${TAG}\` |"
+              echo "| Bump | ${BUMP} (${WHY}) |"
+              echo "| Previous | \`${PREVIOUS}\` |"
+              echo "| Release | ${URL} |"
+              echo "| Use | \`go get github.com/huponx/go-anki-deck@${TAG}\` |"
+            else
+              echo "| Released | no |"
+              echo "| Reason | ${REASON:-see logs} |"
+              echo "| Previous | \`${PREVIOUS:-none}\` |"
+            fi
+          } >> "${GITHUB_STEP_SUMMARY}"
